@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -82,18 +83,32 @@ class Config:
                 self.data.update(loaded)
         except FileNotFoundError:
             pass
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             print(f"[config] 读取配置失败，使用默认值: {exc}")
 
     def save(self) -> None:
+        tmp: Path | None = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(".json.tmp")
-            with open(tmp, "w", encoding="utf-8") as fh:
+            # 同目录原子替换；独占创建随机临时文件，避免固定 .tmp 的符号链接和并发覆盖。
+            # NamedTemporaryFile 默认权限 0600，额外参数可能含 Access 凭据，不应公开读取。
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=self.path.parent,
+                prefix=f".{self.path.name}.", suffix=".tmp", delete=False,
+            ) as fh:
+                tmp = Path(fh.name)
                 json.dump(self.data, fh, ensure_ascii=False, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
             tmp.replace(self.path)
-        except OSError as exc:
+        except (OSError, UnicodeError, TypeError, ValueError) as exc:
             print(f"[config] 保存配置失败: {exc}")
+        finally:
+            if tmp is not None:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def get(self, key: str, default: Any = None) -> Any:
         return self.data.get(key, default)
