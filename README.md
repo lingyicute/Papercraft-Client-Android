@@ -111,6 +111,27 @@ sudo pacman -S python-gobject gtk4 libadwaita
 python3 main.py
 ```
 
+## 本地回归测试
+
+安装上述 GTK / PyGObject 依赖后，使用能导入 `gi` 的 Python（Debian / Ubuntu
+通常是 `/usr/bin/python3`）。无显示测试不会访问网络或启动真实 cloudflared：
+
+```bash
+python3 tests/test_quick_tunnel.py
+python3 -m unittest discover -s tests -p 'test_*.py' -v
+```
+
+GTK 测试需要 `xvfb` / `xauth`，已有端到端测试还需要 `xdotool` / `xclip`：
+
+```bash
+GTK_A11Y=none G_DEBUG=fatal-warnings xvfb-run -a python3 tests/ui_regressions.py -v
+xvfb-run -a python3 tests/e2e_quick_tunnel.py
+xvfb-run -a python3 tests/e2e_tunnel_dialog.py
+```
+
+Pull request 会运行检查；仅非 PR 构建打包。发布必须同时通过检查与两种打包作业，
+`nightly` 标签指向实际构建的提交，发布附件包含 `SHA256SUMS`（用于完整性检查，不是签名）。
+
 ## 构建（GitHub Actions）
 
 `.github/workflows/build.yaml` 包含四个作业：
