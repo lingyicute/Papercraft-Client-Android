@@ -14,7 +14,7 @@ from .binary_manager import BinaryManager, format_eta, format_size, format_speed
 
 class ReleaseRow(Adw.ActionRow):
     def __init__(self, page: "VersionsPage", release: dict):
-        super().__init__()
+        super().__init__(use_markup=False)
         self.tag = release["tag"]
         self.bm: BinaryManager = page.bm
         self.set_title(self.tag)
@@ -102,7 +102,7 @@ class VersionsPage(Adw.PreferencesPage):
             title="当前使用的 cloudflared",
             description=f"平台 {self.bm.system}/{self.bm.arch} · 资源名 {self.bm.asset}",
         )
-        self.current_row = Adw.ActionRow(title="检测中…")
+        self.current_row = Adw.ActionRow(use_markup=False, title="检测中…")
         self.current_icon = Gtk.Image.new_from_icon_name("application-x-executable-symbolic")
         self.current_row.add_prefix(self.current_icon)
         refresh_cur = Gtk.Button(
@@ -196,7 +196,9 @@ class VersionsPage(Adw.PreferencesPage):
 
     def _add_choice(self, key: str, title: str, subtitle: str, checked: bool,
                     sensitive: bool = True, deletable: bool = False) -> None:
-        row = Adw.ActionRow(title=title, subtitle=subtitle)
+        row = Adw.ActionRow(use_markup=False)
+        row.set_title(title)
+        row.set_subtitle(subtitle)
         check = Gtk.CheckButton(valign=Gtk.Align.CENTER, sensitive=sensitive)
         if self._radio_leader is None:
             self._radio_leader = check
@@ -277,7 +279,8 @@ class VersionsPage(Adw.PreferencesPage):
 
     def _set_release_placeholder(self, text: str, icon: str) -> None:
         self._clear_release_widgets()
-        row = Adw.ActionRow(title=text)
+        row = Adw.ActionRow(use_markup=False)
+        row.set_title(text)
         row.add_prefix(Gtk.Image.new_from_icon_name(icon))
         self.g_releases.add(row)
         self._release_widgets.append(row)

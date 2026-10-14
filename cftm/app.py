@@ -59,7 +59,7 @@ CSS = """
 
 class TunnelRow(Adw.ActionRow):
     def __init__(self, proc: TunnelProcess, win: "MainWindow"):
-        super().__init__(activatable=False)
+        super().__init__(activatable=False, use_markup=False)
         self.proc = proc
         self.win = win
         tid = proc.config.id
@@ -105,8 +105,7 @@ class TunnelRow(Adw.ActionRow):
 
     def refresh(self) -> None:
         cfg = self.proc.config
-        # ActionRow 的 title/subtitle 是纯文本，不要 markup_escape_text，
-        # 否则名字里的 "&" 会被显示成 "&amp;"。
+        # PreferencesRow 默认开启 markup；构造时显式关闭后才能原样显示用户输入。
         self.set_title(cfg.display_name)
         subtitle = f"{cfg.hostname}  →  {cfg.listen_host}:{cfg.port}"
         if cfg.autostart:
