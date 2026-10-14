@@ -111,6 +111,8 @@ class QuickTunnelWatcher:
         self._handled: set[str] = set()
         self._pending_id: int = 0
         self._dialog: Optional[Adw.MessageDialog] = None
+        # forget() 之后、窗口真正失去过一次焦点之前，不要读剪贴板（见 forget 的说明）
+        self._suppress_until_leave = False
 
         # window=None 是留给无显示环境单元测试的缝：只构造判定状态机，不接 GTK。
         self._controller: Optional[Gtk.EventControllerFocus] = None
@@ -126,12 +128,22 @@ class QuickTunnelWatcher:
         用户在预填好的新建对话框里点了“取消”（而非“保存”）时调用：链接并没有被
         真正建出来，不应被 :meth:`consider` 的“一个会话只问一次”吞掉，下次切回
         窗口还应当再问一遍。
+
+        “下次切回窗口”指的是用户主动切回来。预填对话框是模态的，它一关闭，窗口管理器
+        会立刻把焦点还给主窗口，这会触发一次 enter —— 如果把这次 enter 也当成“切回
+        窗口”，剪贴板里还是那条链接，确认框就会在用户点“取消”的一瞬间再次弹出来，
+        形成“是 → 取消 → 是否连接？→ 是 → 取消 → …”的死循环，只能靠点“否”逃出去。
+        所以这里同时置一个标志：在主窗口真正失去过一次焦点（leave）之前，enter 不读剪贴板。
         """
         self._handled.discard(host)
+        self._suppress_until_leave = True
 
     # ------------------------------------------------------------ 焦点
     def _on_focus_enter(self, *_args) -> None:
         self.cancel_pending()
+        if self._suppress_until_leave:
+            # 这是对话框关闭后 WM 自动还回来的焦点，不是用户切回窗口
+            return
         if not self._is_enabled():
             return
         self._pending_id = GLib.timeout_add(self.CLIPBOARD_DELAY_MS, self._read_clipboard)
@@ -139,6 +151,8 @@ class QuickTunnelWatcher:
     def _on_focus_leave(self, *_args) -> None:
         # 焦点还没等够延迟就又走了（alt-tab 掠过）：这次不读剪贴板
         self.cancel_pending()
+        # 用户确实离开了窗口：下一次 enter 才算“切回窗口”
+        self._suppress_until_leave = False
 
     def cancel_pending(self) -> None:
         if self._pending_id:

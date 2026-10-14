@@ -107,6 +107,22 @@ def watcher_checks():
     checks.append((reasked == "brand-new.trycloudflare.com" and asked.count("brand-new.trycloudflare.com") == 2,
                    "forget 后同一条链接可再次询问"))
 
+    # M2b：forget() 之后紧跟着的那次 enter 是 WM 把焦点还给主窗口，不读剪贴板；
+    # 主窗口真正 leave 过一次之后，下一次 enter 才重新读
+    w, asked, _ = make_watcher()
+    w.forget("brand-new.trycloudflare.com")
+    w._on_focus_enter()
+    checks.append((w._pending_id == 0, "forget 后紧接的 enter 不读剪贴板（避免取消后立刻再问）"))
+    w._on_focus_leave()
+    w._on_focus_enter()
+    checks.append((w._pending_id != 0, "leave 过一次之后的 enter 恢复读剪贴板"))
+    w.cancel_pending()
+    # 没有 forget 时 enter 应当照常读剪贴板
+    w, asked, _ = make_watcher()
+    w._on_focus_enter()
+    checks.append((w._pending_id != 0, "普通 enter 照常读剪贴板"))
+    w.cancel_pending()
+
     # 功能开关关闭 -> 什么都不做
     w, asked, _ = make_watcher(enabled=False)
     got = w.consider("https://disabled-abc.trycloudflare.com")

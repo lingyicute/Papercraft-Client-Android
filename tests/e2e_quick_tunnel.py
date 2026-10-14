@@ -126,6 +126,7 @@ class TestApp(Application):
             (700, self.s1_arm), (400, self.s2_focus_main), (100, self.s3_expect_dialog),
             (200, self.s4_click_yes), (100, self.s5_expect_editor),
             (200, self.s5b_cancel_editor), (100, self.s5c_refocus_after_cancel),
+            (900, self.s5c2_expect_no_dialog_right_after_cancel),
             (100, self.s5d_expect_dialog_again), (100, self.s5e_expect_editor_again),
             (300, self.s6_type_and_enter), (100, self.s7_expect_saved),
             (200, self.s8_refocus_dedup), (900, self.s9_expect_no_dialog),
@@ -232,7 +233,15 @@ class TestApp(Application):
         # 等取消的对话框真正关闭
         if open_editors():
             return lambda: not open_editors()
-        print("[5c] 取消后 alt-tab 出去再切回 —— 同一条链接应当被再次询问")
+        print("[5c] 模拟 WM 把焦点还给主窗口 —— 这一次不应再次弹窗（否则取消后会立刻被再问一遍）")
+        # Xvfb 下没有窗口管理器，模态对话框关闭后焦点不会自动回到主窗口，这里手动还回去
+        self.focus(self.win)
+
+    def s5c2_expect_no_dialog_right_after_cancel(self):
+        # 否定断言：给足 150 ms 延迟 + 读剪贴板的观察窗口
+        dlgs = message_dialogs()
+        check(not dlgs, "取消预填对话框、焦点自动回到主窗口时不会立刻再次询问", f"got {len(dlgs)}")
+        print("[5c2] 再 alt-tab 出去、切回来 —— 这才算“下次切回窗口”，应当再次询问")
         self.focus(self.decoy)
         GLib.timeout_add(300, lambda: (self.focus(self.win), False)[1])
 
