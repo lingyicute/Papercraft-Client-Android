@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import platform
 import re
@@ -87,6 +88,17 @@ def _is_safe_tag(tag: object) -> bool:
     if tag.startswith("."):
         return False
     return True
+
+def _parse_sha256_digest(digest: object) -> Optional[str]:
+    """把 GitHub API 的 ``sha256:<hex>`` 解析成小写 hex；格式不认识就返回 None（跳过校验）。"""
+    if not isinstance(digest, str):
+        return None
+    algo, _, hexdigest = digest.strip().partition(":")
+    hexdigest = hexdigest.strip().lower()
+    if algo.strip().lower() != "sha256" or not re.fullmatch(r"[0-9a-f]{64}", hexdigest):
+        return None
+    return hexdigest
+
 
 def format_size(num: float) -> str:
     """把字节数格式化为人类可读的字符串，如「12.3 MB」。"""
@@ -257,16 +269,25 @@ class BinaryManager:
                     assets = rel.get("assets", [])
                     if not isinstance(assets, list):
                         assets = []
-                    names = {a.get("name") for a in assets if isinstance(a, dict) and isinstance(a.get("name"), str)}
                     tag = rel.get("tag_name", "")
                     if not isinstance(tag, str) or not tag:
                         continue
+                    # 顺手记下本平台资源的 sha256（GitHub 的 "digest" 字段）和大小，
+                    # 下载完成后据此校验：api.github.com 和实际下发文件的 CDN 不是同一台主机，
+                    # 多一道独立来源的完整性检查，也能拦住静默截断的半截文件。
+                    asset = next(
+                        (a for a in assets if isinstance(a, dict) and a.get("name") == self.asset), None
+                    )
+                    digest = asset.get("digest") if asset else None
+                    size = asset.get("size") if asset else None
                     releases.append(
                         {
                             "tag": tag,
                             "published": (rel.get("published_at") or "")[:10],
                             "prerelease": bool(rel.get("prerelease")),
-                            "has_asset": self.asset in names,
+                            "has_asset": asset is not None,
+                            "digest": digest if isinstance(digest, str) else None,
+                            "size": size if isinstance(size, int) and size > 0 else None,
                         }
                     )
                 GLib.idle_add(callback, releases, None)
@@ -280,8 +301,16 @@ class BinaryManager:
         tag: str,
         progress_cb: Callable[[str, float], None],
         done_cb: Callable[[str, Optional[str]], None],
+        *,
+        digest: Optional[str] = None,
+        size: Optional[int] = None,
     ) -> None:
-        """异步下载并安装某个版本。progress 为 0~1，未知大小时为 -1。"""
+        """异步下载并安装某个版本。progress 为 0~1，未知大小时为 -1。
+
+        :param digest: GitHub Releases API 给出的资源摘要（形如 ``sha256:<hex>``）。
+            提供时下载完成后校验，不符即视为失败并丢弃文件。
+        :param size: API 给出的资源大小（字节），用于在服务器不返回 Content-Length 时核对完整性。
+        """
         if not _is_safe_tag(tag):
             GLib.idle_add(done_cb, tag, "非法的版本号")
             return
@@ -289,6 +318,7 @@ class BinaryManager:
             return
         self._active_downloads[tag] = False
         self._download_stats.pop(tag, None)
+        expected_sha256 = _parse_sha256_digest(digest)
 
         def cleanup(dir_path: Path, *files: Path) -> None:
             """清掉残留文件；目录空了就移除，别留下“这个版本已安装”的假象。"""
@@ -333,6 +363,7 @@ class BinaryManager:
                     except (TypeError, ValueError):
                         total = 0
                     got = 0
+                    hasher = hashlib.sha256()
                     started = time.monotonic()
                     last_emit = 0.0  # 上次向 UI 汇报进度的时刻
                     win_t, win_got = started, 0  # 速度采样窗口的起点
@@ -344,6 +375,7 @@ class BinaryManager:
                         if not chunk:
                             break
                         fh.write(chunk)
+                        hasher.update(chunk)
                         got += len(chunk)
                         now = time.monotonic()
                         if now - win_t >= 1.0:
@@ -364,6 +396,10 @@ class BinaryManager:
                         raise RuntimeError(f"下载不完整（{got}/{total} 字节），请重试")
                     if got == 0:
                         raise RuntimeError("下载的文件为空，请重试")
+                    if size and got != size:
+                        raise RuntimeError(f"文件大小与发布信息不符（{got}/{size} 字节），已丢弃")
+                    if expected_sha256 and hasher.hexdigest() != expected_sha256:
+                        raise RuntimeError("SHA-256 校验失败：文件与 GitHub 发布信息不符，已丢弃")
                     elapsed = max(time.monotonic() - started, 1e-6)
                     self._download_stats[tag] = {"got": got, "total": total, "speed": got / elapsed, "eta": 0.0}
                     GLib.idle_add(progress_cb, tag, 1.0 if total else -1.0)

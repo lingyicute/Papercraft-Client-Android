@@ -91,6 +91,7 @@ class VersionsPage(Adw.PreferencesPage):
         self._installed_rows: list[Gtk.Widget] = []
         self._release_widgets: list[Gtk.Widget] = []
         self._release_rows: dict[str, ReleaseRow] = {}
+        self._releases: dict[str, dict] = {}  # tag -> fetch_releases 返回的条目（含 digest/size）
         self._radio_leader: Optional[Gtk.CheckButton] = None
         self._suppress_select = False
         self.latest_tag: Optional[str] = None
@@ -303,6 +304,7 @@ class VersionsPage(Adw.PreferencesPage):
             self._install_after_fetch = False
             return
         self._clear_release_widgets()
+        self._releases = {r["tag"]: r for r in releases}
         self.latest_tag = next(
             (r["tag"] for r in releases if r["has_asset"] and not r["prerelease"]), None
         )
@@ -357,7 +359,11 @@ class VersionsPage(Adw.PreferencesPage):
         row = self._release_rows.get(tag)
         if row:
             row.set_progress(0.0)
-        self.bm.download(tag, self._on_progress, self._on_done)
+        rel = self._releases.get(tag, {})
+        self.bm.download(
+            tag, self._on_progress, self._on_done,
+            digest=rel.get("digest"), size=rel.get("size"),
+        )
 
     def _on_progress(self, tag: str, fraction: float) -> None:
         row = self._release_rows.get(tag)
