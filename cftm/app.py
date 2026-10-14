@@ -1,6 +1,8 @@
 """应用与主窗口"""
 from __future__ import annotations
 
+import signal
+import sys
 import threading
 from typing import Optional
 
@@ -640,6 +642,15 @@ class Application(Adw.Application):
         self.set_accels_for_action("app.quit", ["<primary>q"])
         self.set_accels_for_action("win.new-tunnel", ["<primary>n"])
 
+        # SIGTERM / SIGHUP（注销、`kill`、`flatpak kill`、关掉启动它的终端）默认会让 Python
+        # 立刻死掉，do_shutdown 跑不到，已经起来的 cloudflared 全部变成孤儿进程继续占着端口。
+        # 转成正常退出：quit() → 主循环结束 → do_shutdown → stop_all(force=True)。
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            try:
+                GLib.unix_signal_add(GLib.PRIORITY_HIGH, signum, self._on_unix_signal, signum)
+            except (AttributeError, ValueError):  # 非 Unix 平台 / 不支持的信号
+                pass
+
     def _register_app_icon(self) -> None:
         # 非 Flatpak、且未安装到系统时，把 SVG 图标与 .desktop 文件放到 ~/.local/share，
         # 这样 GNOME Shell / KDE Plasma 等才能通过 app_id / WM_CLASS 找到任务栏图标
@@ -658,9 +669,18 @@ class Application(Adw.Application):
         if theme.has_icon(APP_ID):
             Gtk.Window.set_default_icon_name(APP_ID)
 
+    def main_window(self) -> Optional["MainWindow"]:
+        """主窗口（按类型查找，而不是依赖 ``props.active_window`` 恰好是它）。"""
+        return next((w for w in self.get_windows() if isinstance(w, MainWindow)), None)
+
     def do_activate(self) -> None:
-        win = self.props.active_window or MainWindow(self)
+        win = self.main_window() or MainWindow(self)
         win.present()
+
+    def _on_unix_signal(self, signum: int) -> bool:
+        print(f"[app] 收到信号 {signal.Signals(signum).name}，正在退出并断开所有隧道", file=sys.stderr)
+        self.quit()
+        return GLib.SOURCE_REMOVE
 
     def do_shutdown(self) -> None:
         # 退出时强制结束所有隧道，避免 SIGTERM 后 5 秒强制杀的定时器因主循环已退出而不执行
@@ -668,15 +688,15 @@ class Application(Adw.Application):
         Adw.Application.do_shutdown(self)
 
     def _on_quit(self, *_args) -> None:
-        win = self.props.active_window
+        win = self.main_window()
         if win:
-            win.close()
+            win.close()  # 走 close-request，仍有隧道在跑时会先确认
         else:
             self.quit()
 
     def _on_about(self, *_args) -> None:
         about = Adw.AboutWindow(
-            transient_for=self.props.active_window,
+            transient_for=self.main_window(),
             application_name=APP_NAME,
             application_icon=APP_ID,
             version=__version__,
@@ -690,6 +710,4 @@ class Application(Adw.Application):
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    import sys
-
     return Application().run(argv if argv is not None else sys.argv)
