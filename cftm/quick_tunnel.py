@@ -15,7 +15,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
 QUICK_TUNNEL_DOMAIN = "trycloudflare.com"
 
@@ -110,6 +110,8 @@ class QuickTunnelWatcher:
         self._known_hostnames = known_hostnames if known_hostnames is not None else (lambda: set())
         self._handled: set[str] = set()
         self._pending_id: int = 0
+        self._read_generation = 0
+        self._read_cancel: Optional[Gio.Cancellable] = None
         self._dialog: Optional[Adw.MessageDialog] = None
         # forget() 之后、窗口真正失去过一次焦点之前，不要读剪贴板（见 forget 的说明）
         self._suppress_until_leave = False
@@ -135,6 +137,7 @@ class QuickTunnelWatcher:
         形成“是 → 取消 → 是否连接？→ 是 → 取消 → …”的死循环，只能靠点“否”逃出去。
         所以这里同时置一个标志：在主窗口真正失去过一次焦点（leave）之前，enter 不读剪贴板。
         """
+        self.cancel_pending()
         self._handled.discard(host)
         self._suppress_until_leave = True
 
@@ -155,6 +158,10 @@ class QuickTunnelWatcher:
         self._suppress_until_leave = False
 
     def cancel_pending(self) -> None:
+        self._read_generation += 1
+        if self._read_cancel is not None:
+            self._read_cancel.cancel()
+            self._read_cancel = None
         if self._pending_id:
             GLib.source_remove(self._pending_id)
             self._pending_id = 0
@@ -162,17 +169,21 @@ class QuickTunnelWatcher:
     # ------------------------------------------------------------ 剪贴板
     def _read_clipboard(self) -> bool:
         self._pending_id = 0
+        self.cancel_pending()
         if not self._is_enabled() or not self._window_alive():
             return False
         try:
             display = self.window.get_display() or Gdk.Display.get_default()
-            display.get_clipboard().read_text_async(None, self._on_clipboard_text)
+            self._read_cancel = Gio.Cancellable()
+            display.get_clipboard().read_text_async(
+                self._read_cancel, self._on_clipboard_text, self._read_generation,
+            )
         except Exception:  # noqa: BLE001
             # 无显示环境 / 窗口正在销毁：这个功能是锦上添花，不该影响主流程
             pass
         return False
 
-    def _on_clipboard_text(self, clipboard, result) -> None:
+    def _on_clipboard_text(self, clipboard, result, generation: int) -> None:
         try:
             text = clipboard.read_text_finish(result)
         except GLib.Error:
@@ -180,11 +191,15 @@ class QuickTunnelWatcher:
             return
         except Exception:  # noqa: BLE001
             return
+        # 完成已发出的异步请求，但丢弃旧焦点、取消/关闭或更新一次读取之前的结果。
+        if generation != self._read_generation:
+            return
+        self._read_cancel = None
         self.consider(text)
 
     def _window_alive(self) -> bool:
         try:
-            return self.window.get_display() is not None
+            return self.window.get_visible() and self.window.get_display() is not None
         except Exception:  # noqa: BLE001  (窗口已被销毁)
             return False
 
@@ -201,11 +216,11 @@ class QuickTunnelWatcher:
             # 已经有一个确认框开着：这次不要把链接消耗掉。否则它会被记进 _handled
             # 却从来没被问过，本会话里再也弹不出来了——等下次获得焦点再问。
             return None
+        if not self._window_alive():
+            return None
         self._handled.add(host)
         if host in self._known_hostnames():
             # 这条隧道已经建过了（快速隧道的子域是随机且唯一的），不再打扰
-            return None
-        if not self._window_alive():
             return None
         self._ask(host)
         return host

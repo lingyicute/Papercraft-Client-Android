@@ -448,6 +448,8 @@ class MainWindow(Adw.ApplicationWindow):
     def _on_toggle_quick_tunnel(self, action, value: GLib.Variant) -> None:
         action.set_state(value)
         enabled = value.get_boolean()
+        if not enabled:
+            self.quick_tunnel.cancel_pending()
         self.config.set("clipboard_quick_tunnel", enabled)
         self.config.save()
         self.toast(
