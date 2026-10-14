@@ -238,19 +238,23 @@ class TunnelProcess(GObject.Object):
         stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self._on_line, stream)
 
     def _on_line(self, stream: Gio.DataInputStream, result, _data) -> None:
+        # 用字节版 read_line_finish 自己解码，而不是 read_line_finish_utf8：
+        # 后者遇到任何一行非法 UTF-8 就抛 GLib.Error（G_CONVERT_ERROR_ILLEGAL_SEQUENCE），
+        # 原来的代码把它当成 EOF 处理，之后再也不读管道 —— 日志窗口从那一行起永远不更新，
+        # 管道（64 KiB）写满后 cloudflared 的日志写入也会被阻塞住。
         try:
-            line, _length = stream.read_line_finish_utf8(result)
+            raw, _length = stream.read_line_finish(result)
         except GLib.Error:
-            line = None
+            raw = None  # 真正的 I/O 错误（管道已关闭等）才视为 EOF
         if stream is not self._stream:
             return
-        if line is None:
+        if raw is None:
             # EOF：进程退出时最后几行日志（往往就是失败原因）已经读完，可以收尾了
             self._eof = True
             if self._pending_exit is not None:
                 self._finish_exit()
             return
-        text = line.rstrip("\r\n")
+        text = bytes(raw).decode("utf-8", errors="replace").rstrip("\r\n")
         if text:
             self._append(text)
             low = text.lower()
@@ -274,9 +278,19 @@ class TunnelProcess(GObject.Object):
             # 管道里可能还压着没读完的输出，等 _on_line 读到 EOF 再改状态；
             # 万一写入端被子进程的后代长期持有，兜底定时器负责收尾。
             self._pending_exit = code
-            GLib.timeout_add(2000, self._finish_exit)
+            GLib.timeout_add(2000, self._finish_exit_fallback, proc)
         else:
             self._finish_exit(code)
+
+    def _finish_exit_fallback(self, proc: Gio.Subprocess) -> bool:
+        """兜底定时器：只对“它自己那一次”进程生效。
+
+        不带 proc 直接挂 ``_finish_exit`` 的话，用户在 2 秒内断开又重连、新进程也很快
+        退出时，旧定时器会把新进程的 ``_pending_exit`` 提前消费掉，新进程最后几行日志丢失。
+        """
+        if self._proc is proc and self._pending_exit is not None:
+            self._finish_exit()
+        return False
 
     def _finish_exit(self, code: Optional[int] = None) -> bool:
         """进程退出后的统一收尾：EOF 回调与兜底定时器谁先到谁负责，只生效一次。"""
