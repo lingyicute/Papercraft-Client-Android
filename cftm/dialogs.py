@@ -23,6 +23,24 @@ def _escape_shortcut(window: Gtk.Window) -> None:
     window.add_controller(controller)
 
 
+def _quit_shortcut(window: Gtk.Window, parent: Gtk.Window) -> None:
+    """让 Ctrl+Q 在这个窗口里也能退出应用。
+
+    这些窗口只设置了 transient_for、没有挂到 Gtk.Application 上（故意的：挂上去之后
+    主窗口关闭时它们不会跟着销毁，应用会一直不退出），因此 ``set_accels_for_action``
+    注册的 app 级快捷键在这里不生效，得自己接一条。
+    """
+    app = parent.get_application() if parent is not None else None
+    if app is None:
+        return
+    controller = Gtk.ShortcutController()
+    controller.set_scope(Gtk.ShortcutScope.LOCAL)
+    trigger = Gtk.ShortcutTrigger.parse_string("<Control>q")
+    action = Gtk.CallbackAction.new(lambda *_: (app.activate_action("quit", None), True)[1])
+    controller.add_shortcut(Gtk.Shortcut.new(trigger, action))
+    window.add_controller(controller)
+
+
 def _walk(widget: Gtk.Widget):
     """深度遍历一棵控件树（含自身）。"""
     pending = [widget]
@@ -227,11 +245,17 @@ class TunnelDialog(Adw.Window):
 class LogWindow(Adw.Window):
     """某个隧道的实时输出。"""
 
+    #: TextBuffer 里最多保留多少行（与 TunnelProcess 的 deque 上限一致）
+    MAX_LINES = 3000
+    #: 超过上限多少行才截断一次：避免每来一行都删一行
+    TRIM_SLACK = 200
+
     def __init__(self, parent: Gtk.Window, proc: TunnelProcess):
         super().__init__(transient_for=parent, default_width=760, default_height=480)
         self.proc = proc
         self.set_title(f"日志 · {proc.config.display_name}")
         _escape_shortcut(self)
+        _quit_shortcut(self, parent)
 
         view = Adw.ToolbarView()
         header = Adw.HeaderBar()
@@ -279,12 +303,27 @@ class LogWindow(Adw.Window):
         self.buffer.insert(end, line + "\n")
         # TextBuffer 不像 deque 有 maxlen：cloudflared 开 debug 日志时会狂刷输出，
         # 不截断的话窗口开久了内存暴涨、UI 卡死。与 TunnelProcess 保持同样的 3000 行上限。
-        if self.buffer.get_line_count() > 3200:
-            start = self.buffer.get_start_iter()
-            cut = self.buffer.get_iter_at_line(200)
-            self.buffer.delete(start, cut)
+        line_count = self.buffer.get_line_count()
+        if line_count > self.MAX_LINES + self.TRIM_SLACK:
+            self._trim_to(self.MAX_LINES)
         if self.follow_btn.get_active():
             self.textview.scroll_to_mark(self.end_mark, 0.0, False, 0.0, 1.0)
+
+    def _trim_to(self, keep_lines: int) -> None:
+        """只保留缓冲区末尾的 ``keep_lines`` 行。
+
+        GTK4 里 ``Gtk.TextBuffer.get_iter_at_line()`` 的 C 签名多了一个 gboolean 返回值，
+        PyGObject 因此返回 ``(found, iter)`` 二元组而不是 iter 本身；直接把它传给
+        ``delete()`` 会抛 ``TypeError: Expected Gtk.TextIter, but got _ResultTuple``。
+        这个异常发生在 ``log-line`` 信号回调里，不会让程序崩溃，但截断从此永远失败：
+        之后每来一行都打印一条 traceback，缓冲区无上限增长 —— 正是这段代码想避免的事。
+        """
+        cut_line = self.buffer.get_line_count() - keep_lines
+        if cut_line <= 0:
+            return
+        found = self.buffer.get_iter_at_line(cut_line)
+        cut = found[1] if isinstance(found, tuple) else found  # 兼容两种绑定签名
+        self.buffer.delete(self.buffer.get_start_iter(), cut)
 
     def _copy_all(self, *_args) -> None:
         start, end = self.buffer.get_bounds()
