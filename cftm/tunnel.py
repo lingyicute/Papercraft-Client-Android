@@ -1,6 +1,7 @@
 """隧道配置模型与 cloudflared 子进程管理"""
 from __future__ import annotations
 
+import ipaddress
 import shlex
 import signal
 import time
@@ -25,6 +26,25 @@ STATE_LABELS = {
     STATE_RUNNING: "已连接",
     STATE_ERROR: "连接失败",
 }
+
+def listener_address(host: str, port: int) -> str:
+    """生成 host:port，IPv6 字面量必须加方括号；不接受 URL 或内嵌端口。"""
+    host = host.strip() or "127.0.0.1"
+    if any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in host):
+        raise ValueError("监听地址不能包含空白或控制字符")
+    if ":" in host:
+        literal = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+        try:
+            ipaddress.IPv6Address(literal)
+        except ValueError as exc:
+            raise ValueError("监听地址应为主机名或 IP 地址，不能包含协议头或端口") from exc
+        host = f"[{literal}]"
+    elif any(c in host for c in "/?#@[]\\"):
+        raise ValueError("监听地址应为主机名或 IP 地址")
+    if not 1 <= port <= 65535:
+        raise ValueError("端口必须在 1 到 65535 之间")
+    return f"{host}:{port}"
+
 
 @dataclass
 class TunnelConfig:
@@ -79,7 +99,7 @@ class TunnelConfig:
     # 别名，四个子命令共用一个 Action），--url 的 scheme 也只影响缺省值不影响行为，
     # 所以这里固定用 tcp，不必再把“协议类型”存进配置。
     def build_argv(self, binary: str) -> list[str]:
-        if not self.hostname or " " in self.hostname:
+        if not self.hostname or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in self.hostname):
             raise ValueError("无效的隧道主机名")
         argv = [
             binary,
@@ -88,12 +108,14 @@ class TunnelConfig:
             "--hostname",
             self.hostname,
             "--url",
-            f"{self.listen_host or '127.0.0.1'}:{self.port}",
+            listener_address(self.listen_host, self.port),
         ]
         if isinstance(self.extra_args, str) and self.extra_args.strip():
             # extra_args 里引号不配对时 shlex.split 会抛 ValueError，调用方必须捕获
             # （start() 会转为 ERROR 状态，对话框会提前拦截）。
             argv += shlex.split(self.extra_args)
+        if any("\x00" in arg for arg in argv):
+            raise ValueError("命令行参数不能包含 NUL 字符")
         return argv
 
     def command_string(self, binary: str = "cloudflared") -> str:
@@ -175,7 +197,7 @@ class TunnelProcess(GObject.Object):
         except ValueError as exc:
             # extra_args 引号不配对等情况：不要把异常抛给 GTK 信号分发（用户无感知），
             # 而是转为 ERROR 状态并写日志，UI 会弹出 toast + 日志按钮。
-            self.last_error = f"额外参数解析失败: {exc}"
+            self.last_error = f"隧道配置无效: {exc}"
             self._append(f"[启动失败] {self.last_error}")
             self._set_state(STATE_ERROR)
             return
@@ -258,7 +280,9 @@ class TunnelProcess(GObject.Object):
         if text:
             self._append(text)
             low = text.lower()
-            if "start websocket listener" in low or "listening on" in low:
+            if not self._stopping and self._pending_exit is None and (
+                "start websocket listener" in low or "listening on" in low
+            ):
                 self._set_state(STATE_RUNNING)
             # 更精确的错误检测：避免把包含 "error" 子串的普通信息误判
             if " err " in f" {low} " or "level=error" in low or low.lstrip().startswith("error"):
@@ -304,11 +328,9 @@ class TunnelProcess(GObject.Object):
         self._stream = None
         self._running_snapshot = None
         self._append(f"[进程已退出，状态码 {code}]")
-        if self._stopping or code == 0:
-            self._set_state(STATE_STOPPED)
-        else:
-            self._set_state(STATE_ERROR)
+        stopped = self._stopping or code == 0
         self._stopping = False
+        self._set_state(STATE_STOPPED if stopped else STATE_ERROR)
         return False
 
 
@@ -324,6 +346,8 @@ class TunnelManager(GObject.Object):
         super().__init__()
         self.config = config
         self.procs: list[TunnelProcess] = []
+        # 从 UI 删除不等于子进程已经退出；退出前仍需跟踪以便冲突检测和 shutdown 强杀。
+        self._retiring: set[TunnelProcess] = set()
         raw_tunnels = config.get("tunnels", []) or []
         # 手改 config.json 可能把 tunnels 写成 dict/字符串/null：非 list 直接忽略，
         # 否则遍历 dict 的 key（字符串）会让 from_dict 崩溃、应用无窗口。
@@ -337,9 +361,17 @@ class TunnelManager(GObject.Object):
     def _wrap(self, cfg: TunnelConfig) -> TunnelProcess:
         self._ensure_unique_id(cfg)
         proc = TunnelProcess(cfg)
-        proc.connect("state-changed", lambda p, st: self.emit("state-changed", p.config.id, st))
+        proc.connect("state-changed", self._on_process_state)
         self.procs.append(proc)
         return proc
+
+    def _on_process_state(self, proc: TunnelProcess, state: str) -> None:
+        if proc in self._retiring:
+            if not proc.is_active():
+                self._retiring.discard(proc)
+            return
+        if proc in self.procs:
+            self.emit("state-changed", proc.config.id, state)
 
     def _ensure_unique_id(self, cfg: TunnelConfig) -> TunnelConfig:
         """保证 id 是非空且唯一的字符串。
@@ -379,8 +411,10 @@ class TunnelManager(GObject.Object):
         proc = self.get(tunnel_id)
         if proc is None:
             return
-        proc.stop()
         self.procs.remove(proc)
+        if proc.is_active():
+            self._retiring.add(proc)
+        proc.stop()
         self.save()
         self.emit("tunnels-changed")
 
@@ -402,13 +436,19 @@ class TunnelManager(GObject.Object):
         def _norm_host(host: object) -> str:
             h = host if isinstance(host, str) else ""
             h = (h or "127.0.0.1").strip().lower() or "127.0.0.1"
-            # localhost / ::1 通常解析到 127.0.0.1，视为同一地址，便于冲突检测
+            if h.startswith("[") and h.endswith("]"):
+                h = h[1:-1]
+            try:
+                h = str(ipaddress.ip_address(h))
+            except ValueError:
+                pass
+            # 保守地把 localhost / ::1 与 IPv4 回环视为重叠，避免双栈监听漏报
             if h in ("localhost", "::1"):
                 h = "127.0.0.1"
             return h
 
         want_host, want_port = _norm_host(cfg.listen_host), cfg.port
-        for p in self.active():
+        for p in [*self.active(), *self._retiring]:
             if p.config.id == cfg.id:
                 continue
             # 用启动快照而非当前保存值：运行中编辑改了端口后，实际占用的仍是旧端口
@@ -423,5 +463,5 @@ class TunnelManager(GObject.Object):
         return None
 
     def stop_all(self, force: bool = False) -> None:
-        for p in self.procs:
+        for p in [*self.procs, *self._retiring]:
             p.stop(force=force)

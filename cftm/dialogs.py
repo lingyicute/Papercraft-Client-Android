@@ -231,13 +231,18 @@ class TunnelDialog(Adw.Window):
             self._toast("监听地址不能包含空格")
             self.listen_row.grab_focus()
             return
-        cfg = self.cfg
+        cfg = self.cfg.copy()
         cfg.name = self.name_row.get_text().strip()
         cfg.hostname = hostname
         cfg.port = port
         cfg.listen_host = listen_host
         cfg.autostart = self.autostart_row.get_active()
         cfg.extra_args = extra_args
+        try:
+            cfg.build_argv("cloudflared")
+        except ValueError as exc:
+            self._toast(str(exc))
+            return
         self.on_save(cfg)
         self.close()
 
