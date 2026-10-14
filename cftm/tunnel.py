@@ -141,6 +141,9 @@ class TunnelProcess(GObject.Object):
         "log-line": (GObject.SignalFlags.RUN_FIRST, None, (str,)),
     }
 
+    MAX_LOG_LINE_BYTES = 64 * 1024
+    READ_CHUNK_BYTES = 16 * 1024
+
     def __init__(self, config: TunnelConfig):
         super().__init__()
         self.config = config
@@ -149,7 +152,10 @@ class TunnelProcess(GObject.Object):
         self.started_at: Optional[float] = None
         self._log: deque[str] = deque(maxlen=3000)
         self._proc: Optional[Gio.Subprocess] = None
-        self._stream: Optional[Gio.DataInputStream] = None
+        self._stream: Optional[Gio.InputStream] = None
+        self._read_cancel: Optional[Gio.Cancellable] = None
+        self._line_buffer = bytearray()
+        self._line_truncated = False
         self._stopping = False
         # 进程已退出、但管道里可能还压着没读完的输出时，记下退出码，等 EOF 再收尾
         self._pending_exit: Optional[int] = None
@@ -222,7 +228,10 @@ class TunnelProcess(GObject.Object):
 
         self._proc = proc
         self.started_at = time.monotonic()
-        self._stream = Gio.DataInputStream.new(proc.get_stdout_pipe())
+        self._line_buffer.clear()
+        self._line_truncated = False
+        self._read_cancel = Gio.Cancellable()
+        self._stream = proc.get_stdout_pipe()
         self._read_next(self._stream)
         proc.wait_async(None, self._on_exit)
         GLib.timeout_add(2500, self._promote_running, proc)
@@ -252,41 +261,58 @@ class TunnelProcess(GObject.Object):
 
     def _promote_running(self, proc: Gio.Subprocess) -> bool:
         # 用户在这 2.5 秒里点了断开时不要再报“已连接”，否则会弹出一条反直觉的提示
-        if self._proc is proc and self.state == STATE_STARTING and not self._stopping:
+        if (self._proc is proc and self.state == STATE_STARTING
+                and not self._stopping and self._pending_exit is None):
             self._set_state(STATE_RUNNING)
         return False
 
-    def _read_next(self, stream: Gio.DataInputStream) -> None:
-        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self._on_line, stream)
+    def _read_next(self, stream: Gio.InputStream) -> None:
+        stream.read_bytes_async(
+            self.READ_CHUNK_BYTES, GLib.PRIORITY_DEFAULT,
+            self._read_cancel, self._on_read, stream,
+        )
 
-    def _on_line(self, stream: Gio.DataInputStream, result, _data) -> None:
-        # 用字节版 read_line_finish 自己解码，而不是 read_line_finish_utf8：
-        # 后者遇到任何一行非法 UTF-8 就抛 GLib.Error（G_CONVERT_ERROR_ILLEGAL_SEQUENCE），
-        # 原来的代码把它当成 EOF 处理，之后再也不读管道 —— 日志窗口从那一行起永远不更新，
-        # 管道（64 KiB）写满后 cloudflared 的日志写入也会被阻塞住。
+    def _flush_log_line(self) -> None:
+        text = self._line_buffer.decode("utf-8", errors="replace").rstrip("\r")
+        if self._line_truncated:
+            text += " … [日志行过长，已截断]"
+        self._line_buffer.clear()
+        self._line_truncated = False
+        if not text:
+            return
+        self._append(text)
+        low = text.lower()
+        if not self._stopping and not self._eof and self._pending_exit is None and (
+            "start websocket listener" in low or "listening on" in low
+        ):
+            self._set_state(STATE_RUNNING)
+        if " err " in f" {low} " or "level=error" in low or low.lstrip().startswith("error"):
+            self.last_error = text
+
+    def _on_read(self, stream: Gio.InputStream, result, _data) -> None:
+        # DataInputStream.read_line_finish 在部分 PyGObject 版本中把 EOF 的 NULL
+        # 和空行都映射成 b''，无法靠 raw is None 判断，会一直重读 EOF 直到兜底超时。
+        # read_bytes_finish 返回 GBytes，零长度只表示 EOF；同时避免无换行日志无限分配。
         try:
-            raw, _length = stream.read_line_finish(result)
+            data = stream.read_bytes_finish(result).get_data()
         except GLib.Error:
-            raw = None  # 真正的 I/O 错误（管道已关闭等）才视为 EOF
+            data = b""
         if stream is not self._stream:
             return
-        if raw is None:
-            # EOF：进程退出时最后几行日志（往往就是失败原因）已经读完，可以收尾了
+        if not data:
             self._eof = True
+            self._flush_log_line()  # 保留最后一行，即使它没有换行符
             if self._pending_exit is not None:
                 self._finish_exit()
             return
-        text = bytes(raw).decode("utf-8", errors="replace").rstrip("\r\n")
-        if text:
-            self._append(text)
-            low = text.lower()
-            if not self._stopping and self._pending_exit is None and (
-                "start websocket listener" in low or "listening on" in low
-            ):
-                self._set_state(STATE_RUNNING)
-            # 更精确的错误检测：避免把包含 "error" 子串的普通信息误判
-            if " err " in f" {low} " or "level=error" in low or low.lstrip().startswith("error"):
-                self.last_error = text
+        parts = data.split(b"\n")
+        for index, part in enumerate(parts):
+            room = self.MAX_LOG_LINE_BYTES - len(self._line_buffer)
+            self._line_buffer.extend(part[:room])
+            if len(part) > room:
+                self._line_truncated = True
+            if index < len(parts) - 1:
+                self._flush_log_line()
         self._read_next(stream)
 
     def _on_exit(self, proc: Gio.Subprocess, result) -> None:
@@ -299,7 +325,7 @@ class TunnelProcess(GObject.Object):
         code = proc.get_exit_status() if proc.get_if_exited() else -1
         self.started_at = None
         if self._stream is not None and not self._eof:
-            # 管道里可能还压着没读完的输出，等 _on_line 读到 EOF 再改状态；
+            # 管道里可能还压着没读完的输出，等 _on_read 读到 EOF 再改状态；
             # 万一写入端被子进程的后代长期持有，兜底定时器负责收尾。
             self._pending_exit = code
             GLib.timeout_add(2000, self._finish_exit_fallback, proc)
@@ -324,6 +350,12 @@ class TunnelProcess(GObject.Object):
             code, self._pending_exit = self._pending_exit, None
         else:
             self._pending_exit = None
+        # 兜底收尾时管道可能由后代进程持有；取消未完成的读取，释放回调引用。
+        if self._read_cancel is not None:
+            self._read_cancel.cancel()
+            self._read_cancel = None
+        self._eof = True
+        self._flush_log_line()
         self._proc = None
         self._stream = None
         self._running_snapshot = None

@@ -15,7 +15,7 @@ def wait_until(predicate, timeout=4):
     context = GLib.MainContext.default()
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        while context.pending():
+        if context.pending():
             context.iteration(False)
         if predicate():
             return True
@@ -118,9 +118,51 @@ class TunnelTests(unittest.TestCase):
         proc = self.proc()
         proc.state, proc._stopping = STATE_STARTING, True
         stream = Mock()
-        stream.read_line_finish.return_value = (b'listening on 127.0.0.1:2222', 27)
+        stream.read_bytes_finish.return_value = GLib.Bytes.new(b'listening on 127.0.0.1:2222\n')
         proc._stream = stream
         with patch.object(proc, '_read_next'):
-            proc._on_line(stream, None, None)
+            proc._on_read(stream, None, None)
         self.assertEqual(proc.state, STATE_STARTING)
         proc.state, proc._stream = STATE_STOPPED, None
+
+    def test_eof_finishes_without_busy_reading_or_fallback(self):
+        proc = self.proc()
+        with patch.object(proc, '_read_next', wraps=proc._read_next) as read:
+            proc.start(self.script('import os\nos.write(1, b"first\\n\\nlast")\n'))
+            self.assertTrue(wait_until(lambda: not proc.is_active(), timeout=1))
+            self.assertLess(read.call_count, 10)
+        self.assertTrue(any(line.endswith('first') for line in proc.log_lines()))
+        self.assertTrue(any(line.endswith('last') for line in proc.log_lines()))
+
+    def test_long_unterminated_log_line_is_bounded(self):
+        proc = self.proc()
+        proc.start(self.script('import os\nos.write(1, b"x" * (1024 * 1024) + b"\\nlast\\n")\n'))
+        self.assertTrue(wait_until(lambda: not proc.is_active()))
+        self.assertLess(max(map(len, proc.log_lines())), 70000)
+        self.assertTrue(any(line.endswith('last') for line in proc.log_lines()))
+
+    def test_utf8_split_across_reads_is_preserved(self):
+        proc = self.proc()
+        proc.start(self.script('import os,time\nos.write(1, b"\\xe4")\ntime.sleep(0.1)\nos.write(1, b"\\xb8\\xad\\n")\n'))
+        self.assertTrue(wait_until(lambda: not proc.is_active()))
+        self.assertTrue(any(line.endswith('中') for line in proc.log_lines()))
+
+    def test_old_read_does_not_contaminate_new_process(self):
+        proc = self.proc()
+        stream = Mock()
+        stream.read_bytes_finish.return_value = GLib.Bytes.new(b'old process\n')
+        proc._stream = Mock()
+        proc._line_buffer.extend(b'new process')
+        proc._on_read(stream, None, None)
+        self.assertEqual(proc._line_buffer, b'new process')
+        self.assertEqual(proc.log_lines(), [])
+        proc._stream = None
+
+    def test_exited_process_is_not_promoted_while_draining_logs(self):
+        proc = self.proc()
+        proc._proc = object()
+        proc.state = STATE_STARTING
+        proc._pending_exit = 1
+        proc._promote_running(proc._proc)
+        self.assertEqual(proc.state, STATE_STARTING)
+        proc._proc, proc.state = None, STATE_STOPPED
