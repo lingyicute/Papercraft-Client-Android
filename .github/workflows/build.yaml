@@ -178,6 +178,7 @@ jobs:
           upload-artifact: true
 
   release:
+    if: github.event_name != 'pull_request'
     name: Publish release
     needs: [check, pyinstaller, flatpak]
     permissions:
