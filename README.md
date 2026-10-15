@@ -20,7 +20,8 @@
   <a href="https://github.com/lingyicute/Cloudflared-Helper-Desktop/issues">🐛 Report Bug</a>
 </p>
 <br>
-<br>‎
+<br>
+<br>
 
 ## 功能
 
@@ -33,6 +34,8 @@
   - 自动 `chmod +x`，探测并展示当前生效的版本
 - **智能校验**：端口范围检查、低于 1024 端口的权限提示、本地端口冲突检测。
 - **贴心细节**：程序启动时自动连接、复制等效命令行、失败时的日志快捷跳转、退出前的断开确认。
+
+<br>
 
 ## 为什么没有「协议类型」选项
 
@@ -50,6 +53,8 @@ cloudflared access tcp --hostname <隧道主机名> --url <监听地址>:<端口
 > `access tcp` 这个子命令名从 cloudflared `2020.6.1` 起就有了（`2020.5.1` 及更早只有 `access ssh`，
 > 当时还没有 `tcp`）。应用内下载的版本来自官方 Releases 的最新 30 个，全部满足；只有手动把二进制指向
 > 2020 年之前的系统 PATH cloudflared 时，才需要改用 `access ssh`。然而，Cloudflare 官方仅支持一年以内的 cloudflared 版本，出于安全性上的考虑，梨不建议您使用如此古老的 cloudflared。
+
+<br>
 
 ## 剪贴板快速连接
 
@@ -69,10 +74,14 @@ cloudflared access tcp --hostname <隧道主机名> --url <监听地址>:<端口
 
 不想用可以在主菜单里关掉「剪贴板快速连接」，对应配置项 `clipboard_quick_tunnel`。
 
+<br>
+
 ## 配置
 
 - 配置保存在 `~/.config/cloudflared-tunnel-manager/config.json`
 - 二进制保存在 `~/.local/share/cloudflared-tunnel-manager/versions/<版本>/`
+
+<br>
 
 ## 推荐运行方式：Flatpak
 
@@ -93,6 +102,8 @@ flatpak install --user ./cloudflared-tunnel-manager-x86_64.flatpak
 flatpak run uk._92li.cftm.CloudflaredTunnelManager
 ```
 
+<br>
+
 ## 从源码运行（不推荐作为日常运行方式）
 
 依赖：Python ≥ 3.10、GTK 4、libadwaita ≥ 1.4、PyGObject。
@@ -110,6 +121,8 @@ sudo pacman -S python-gobject gtk4 libadwaita
 ```bash
 python3 main.py
 ```
+
+<br>
 
 ## 本地回归测试
 
@@ -129,8 +142,9 @@ xvfb-run -a python3 tests/e2e_quick_tunnel.py
 xvfb-run -a python3 tests/e2e_tunnel_dialog.py
 ```
 
-Pull request 会运行检查；仅非 PR 构建打包。发布必须同时通过检查与两种打包作业，
-`nightly` 标签指向实际构建的提交，发布附件包含 `SHA256SUMS`（用于完整性检查，不是签名）。
+Pull request 会运行检查。
+
+<br>
 
 ## 构建（GitHub Actions）
 
@@ -169,6 +183,8 @@ dist/cloudflared-tunnel-manager/cloudflared-tunnel-manager --self-test
 > `Analysis(hooksconfig={"gi": {"module-versions": ...}})` 指定，
 > 命令行参数无法表达，所以构建配置放在 `cloudflared-tunnel-manager.spec` 中。
 
+<br>
+
 ## 目录结构
 
 ```
@@ -186,6 +202,8 @@ tests/                       单元测试（无需显示）+ UI 端到端测试�
 .github/workflows/build.yaml CI / 发布流程
 index.html                   项目主页
 ```
+
+<br>
 
 ## 🗂️ License
 
